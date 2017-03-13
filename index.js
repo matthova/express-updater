@@ -1,7 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const git = require('simple-git')(process.env.PWD);
+const equal = require('deep-equal');
+const exec = require('child_process').exec;
 
+// Return an array of objects
+// Each object contains the tag name and its associated SHA
 function createTagList() {
   const tagList = [];
   return new Promise((r1, e1) => {
@@ -21,6 +25,32 @@ function createTagList() {
     });
   });
 }
+
+async function differentNpmDependencies(currentSha, newSha) {
+  const currentDependencies = await new Promise((resolve, reject) => {
+    git.show([`${currentSha}:package.json`], (err, result) => {
+      const packageJson = JSON.parse(result);
+      const packages = {
+        dependencies: packageJson.dependencies,
+        devDependencies: packageJson.devDependencies,
+      }
+      resolve(packages);
+    });
+  });
+
+  const newDependencies = await new Promise((resolve, reject) => {
+    git.show([`${newSha}:package.json`], (err, result) => {
+      const packageJson = JSON.parse(result);
+      const packages = {
+        dependencies: packageJson.dependencies,
+        devDependencies: packageJson.devDependencies,
+      }
+      resolve(packages);
+    });
+  });
+  return !equal(currentDependencies, newDependencies);
+}
+
 
 git.fetch(() => {
   /* GET home page. */
@@ -58,6 +88,13 @@ git.fetch(() => {
   });
 
   router.post('/update', async function(req, res, next) {
+
+    const currentSha = await new Promise((resolve, reject) => {
+      git.revparse(['HEAD'], (err, response) => {
+        resolve(response.split('\n')[0]);
+      });
+    });
+
     const tagList = await createTagList();
 
     const match = tagList.find(tag => {
@@ -65,12 +102,37 @@ git.fetch(() => {
     });
 
     // if it is, then check out the sha
-    if (match) {
-      git.checkout(match.sha, (error, response) => {
+    if (match && match.sha !== currentSha) {
+      git.checkout(match.sha, async (error, response) => {
         if (error) {
           return res.json({ error });
         }
-      return res.redirect('/');
+
+        // if the dependencies change, reinstall them
+        if (await differentNpmDependencies(currentSha, match.sha)) {
+          try {
+            console.log('starting', new Date());
+            exec(`npm install --prefix ${process.env.PWD}/tmp_modules -g`, (error, stdout, stderr) => {
+              if (error) {
+                console.error(`exec error: ${error}`);
+                return;
+              }
+
+              // figure out the name of the app from package.json
+              const packageName = require(`${process.env.PWD}/package.json`).name;
+              const initialPath = `${process.env.PWD}/tmp_modules/lib/node_modules/${packageName}/node_modules`;
+              const finalPath = `${process.env.PWD}/node_modules`;
+              // replace node_modules with the existing node_modules
+              exec(`mv ${initialPath} ${finalPath}`, async (error, stdout, stderr) => {
+                // delete the extranneous modules
+                exec(`rm -rf ${process.env.PWD}/tmp_modules`);
+              });
+            });
+          } catch (ex) {
+            console.log('eh?', ex);
+          }
+        }
+        return res.redirect('/');
       });
     } else {
       return res.redirect('/');
